@@ -7,6 +7,8 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 )
 
+require go.uber.org/goleak v1.3.0 // indirect
+
 require (
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/go-ole/go-ole v1.2.6 // indirect

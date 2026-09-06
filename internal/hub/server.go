@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -31,6 +32,7 @@ type Server struct {
 	config  Config
 	mu      sync.RWMutex
 	agents  map[string]EnrollmentResponse
+	tenants map[string]string
 	metrics []MetricEvent
 	reports []HardeningReport
 }
@@ -69,7 +71,7 @@ func NewServer(config Config) *Server {
 	if config.CollectorIntervalSeconds <= 0 {
 		config.CollectorIntervalSeconds = 30
 	}
-	return &Server{config: config, agents: make(map[string]EnrollmentResponse)}
+	return &Server{config: config, agents: make(map[string]EnrollmentResponse), tenants: make(map[string]string)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -88,12 +90,24 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
 	if strings.TrimSpace(r.Header.Get("X-Tenant-ID")) == "" || strings.TrimSpace(r.Header.Get("X-Agent-ID")) == "" {
+		slog.Warn("security event: missing agent identity", "component", "hub", "event", "security_drop", "reason", "missing_identity")
 		http.Error(w, "missing tenant or agent identity", http.StatusBadRequest)
 		return false
 	}
 	if s.config.AuthToken == "" || r.Header.Get("Authorization") != "Bearer "+s.config.AuthToken {
+		slog.Warn("security event: invalid bearer token", "component", "hub", "event", "security_drop", "reason", "invalid_bearer_token", "agent_id", r.Header.Get("X-Agent-ID"))
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
+	}
+	if r.URL.Path != "/api/v1/agent/enroll" {
+		s.mu.RLock()
+		enrolledTenant, enrolled := s.tenants[r.Header.Get("X-Agent-ID")]
+		s.mu.RUnlock()
+		if !enrolled || enrolledTenant != r.Header.Get("X-Tenant-ID") {
+			slog.Warn("security event: agent identity mismatch", "component", "hub", "event", "security_drop", "reason", "identity_mismatch", "agent_id", r.Header.Get("X-Agent-ID"))
+			http.Error(w, "agent identity is not enrolled for tenant", http.StatusForbidden)
+			return false
+		}
 	}
 	return true
 }
@@ -120,6 +134,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	response := EnrollmentResponse{AgentID: request.AgentID, MTLSSharedSecret: secret, Status: "enrolled"}
 	s.mu.Lock()
 	s.agents[request.AgentID] = response
+	s.tenants[request.AgentID] = r.Header.Get("X-Tenant-ID")
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response)
 }
@@ -262,6 +277,12 @@ func TLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
 
 func (s *Server) MetricsCount() int { s.mu.RLock(); defer s.mu.RUnlock(); return len(s.metrics) }
 func (s *Server) ReportsCount() int { s.mu.RLock(); defer s.mu.RUnlock(); return len(s.reports) }
+
+func (s *Server) MetricsSnapshot() []MetricEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]MetricEvent(nil), s.metrics...)
+}
 
 func (s *Server) SignAgentCommand(agentID, command string) (string, error) {
 	s.mu.RLock()
