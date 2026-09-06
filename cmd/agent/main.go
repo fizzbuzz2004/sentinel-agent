@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	agentclient "sentinel-agent/internal/agent"
 	"sentinel-agent/internal/buffer"
 	"sentinel-agent/internal/collector"
 	"sentinel-agent/internal/config"
@@ -75,6 +74,22 @@ func main() {
 		os.Exit(1)
 	}
 	requestHeaders := identityHeaders(identity.Identity{AgentID: agentID, TenantID: tenantID})
+	if authToken != "" {
+		requestHeaders.Set("Authorization", "Bearer "+authToken)
+	}
+	hubClient, err := newHubClient(agentclient.ClientConfig{
+		TenantID:          tenantID,
+		AgentID:           agentID,
+		AuthToken:         authToken,
+		CertFile:          getEnvOrDefault("AGENT_CERT_PATH", "/etc/sentinel/certs/agent.crt"),
+		KeyFile:           getEnvOrDefault("AGENT_KEY_PATH", "/etc/sentinel/certs/agent.key"),
+		CAFile:            getEnvOrDefault("CA_CERT_PATH", "/etc/sentinel/certs/ca.crt"),
+		AllowInsecureHTTP: os.Getenv("AGENT_DEMO_MODE") == "true",
+	})
+	if err != nil {
+		slog.Error("HUB-Client konnte nicht initialisiert werden", "component", "transport", "error", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -100,9 +115,10 @@ func main() {
 	// 2. Automatisches Self-Enrollment beim Start
 	if hubBaseURL != "" && enrollToken != "" {
 		if custInt, err := strconv.Atoi(customerID); err == nil {
-			performAutoEnrollment(ctx, hubBaseURL, enrollToken, nodeID, agentID, custInt, requestHeaders)
+			performAutoEnrollment(ctx, hubClient, hubBaseURL, enrollToken, nodeID, agentID, custInt)
 		}
 	}
+	startCertificateWatcher(ctx, hubClient, hubBaseURL, enrollToken, nodeID, agentID, customerID)
 	_, err = diagnostics.StartWithHandlers(ctx, getEnvOrDefault("AGENT_DEBUG_SOCKET", "/run/sentinel-agent-debug.sock"), map[string]http.HandlerFunc{
 		"/api/v1/hardening": executor.RunAnsiblePlaybook,
 	})
@@ -118,9 +134,9 @@ func main() {
 	engineDone := make(chan struct{})
 	go func() {
 		defer close(engineDone)
-		startResilientEngine(ctx, diskBuffer, runtimeConfig, fimScanner, nodeID, agentID, tenantID, customerID, requestHeaders, hubMetricsURL, authToken)
+		startResilientEngine(ctx, diskBuffer, runtimeConfig, fimScanner, nodeID, agentID, tenantID, customerID, requestHeaders, hubMetricsURL, hubClient)
 	}()
-	startRuntimeConfigPoller(ctx, runtimeConfig, level, requestHeaders)
+	startRuntimeConfigPoller(ctx, runtimeConfig, level, requestHeaders, hubClient)
 	startMemoryWatchdog(ctx, diskBuffer, int64(getEnvInt("AGENT_MEMORY_LIMIT_BYTES", 50*1024*1024)))
 	startSystemdWatchdog(ctx)
 	if _, err := daemon.SdNotify(false, "READY=1"); err != nil {
@@ -144,7 +160,7 @@ func main() {
 	}
 }
 
-func startRuntimeConfigPoller(ctx context.Context, store *config.Store, level *slog.LevelVar, headers http.Header) {
+func startRuntimeConfigPoller(ctx context.Context, store *config.Store, level *slog.LevelVar, headers http.Header, hubClient *agentclient.Client) {
 	endpoint := os.Getenv("HUB_CONFIG_URL")
 	if endpoint == "" {
 		return
@@ -154,10 +170,7 @@ func startRuntimeConfigPoller(ctx context.Context, store *config.Store, level *s
 		if err != nil || len(publicKeyBytes) != ed25519.PublicKeySize {
 			return fmt.Errorf("AGENT_UPDATE_PUBLIC_KEY is missing or invalid")
 		}
-		client, err := createHTTPClient(signal.ManifestURL)
-		if err != nil {
-			return err
-		}
+		client := hubClient.HTTPClient()
 		binaryPath := getEnvOrDefault("AGENT_BINARY_PATH", "/opt/sentinel-agent/sentinel-agent")
 		agentUpdater, err := updater.NewWithHeaders(client, ed25519.PublicKey(publicKeyBytes), binaryPath, headers)
 		if err != nil {
@@ -169,12 +182,15 @@ func startRuntimeConfigPoller(ctx context.Context, store *config.Store, level *s
 		_, _ = daemon.SdNotify(false, "STOPPING=1")
 		serviceName := getEnvOrDefault("AGENT_SYSTEMD_SERVICE", "sentinel-agent.service")
 		if err := updater.RestartService(context.Background(), serviceName); err != nil {
+			if rollbackErr := agentUpdater.Rollback(); rollbackErr != nil {
+				return fmt.Errorf("restart updated agent service: %w; rollback failed: %v", err, rollbackErr)
+			}
 			return fmt.Errorf("restart updated agent service: %w", err)
 		}
 		return nil
 	}
 	poller, err := config.NewPollerWithOptions(endpoint, 5*time.Minute, store, level, headers, updateHandler, func() (*http.Client, error) {
-		return createHTTPClient(endpoint)
+		return hubClient.HTTPClient(), nil
 	})
 	if err != nil {
 		slog.Error("Runtime-Konfigurations-Poller konnte nicht gestartet werden", "component", "config", "error", err)
@@ -237,40 +253,41 @@ func startSystemdWatchdog(ctx context.Context) {
 	}()
 }
 
-func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID, agentID string, customerID int, headers http.Header) {
-	enrollPayload := map[string]interface{}{
-		"enroll_token": enrollToken,
-		"node_id":      nodeID,
-		"agent_id":     agentID,
-		"customer_id":  customerID,
-	}
-
-	data, _ := json.Marshal(enrollPayload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hubBaseURL, "/")+"/api/v1/agent/enroll", bytes.NewBuffer(data))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	copyHeaders(req.Header, headers)
-
-	client, err := createHTTPClient(hubBaseURL)
-	if err != nil {
-		slog.Error("Enrollment-Client konnte nicht initialisiert werden", "error", err)
-		return
-	}
-	resp, err := client.Do(req)
+func performAutoEnrollment(ctx context.Context, hubClient *agentclient.Client, hubBaseURL, enrollToken, nodeID, agentID string, customerID int) {
+	_, err := hubClient.Enroll(ctx, hubBaseURL, enrollToken, nodeID, agentID, customerID)
 	if err != nil {
 		slog.Warn("Auto-Enrollment Verbindung zum Hub fehlgeschlagen (offline mode active)", "error", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		slog.Info("Agent erfolgreich am Hub eingeschrieben", "node_id", nodeID)
-	}
+	slog.Info("Agent erfolgreich am Hub eingeschrieben", "node_id", nodeID)
 }
 
-func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeConfig *config.Store, fimScanner *hardening.FIMScanner, nodeID, agentID, tenantID, customerID string, headers http.Header, hubMetricsURL, authToken string) {
+func startCertificateWatcher(ctx context.Context, hubClient *agentclient.Client, hubBaseURL, enrollToken, nodeID, agentID, customerID string) {
+	if hubBaseURL == "" || enrollToken == "" {
+		return
+	}
+	customerNumber, err := strconv.Atoi(customerID)
+	if err != nil {
+		return
+	}
+	watcher, err := agentclient.NewCertificateWatcher(
+		getEnvOrDefault("AGENT_CERT_PATH", "/etc/sentinel/certs/agent.crt"),
+		getEnvOrDefault("AGENT_KEY_PATH", "/etc/sentinel/certs/agent.key"),
+		time.Duration(getEnvInt("AGENT_CERT_RENEW_BEFORE_SECONDS", 72*60*60))*time.Second,
+		time.Duration(getEnvInt("AGENT_CERT_CHECK_INTERVAL_SECONDS", 300))*time.Second,
+		func(ctx context.Context) error {
+			_, err := hubClient.Enroll(ctx, hubBaseURL, enrollToken, nodeID, agentID, customerNumber)
+			return err
+		},
+	)
+	if err != nil {
+		slog.Error("mTLS-Zertifikats-Watcher konnte nicht gestartet werden", "component", "security", "error", err)
+		return
+	}
+	go watcher.Run(ctx)
+}
+
+func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeConfig *config.Store, fimScanner *hardening.FIMScanner, nodeID, agentID, tenantID, customerID string, headers http.Header, hubMetricsURL string, hubClient *agentclient.Client) {
 	timer := time.NewTimer(runtimeConfig.Load().CollectorInterval)
 	defer timer.Stop()
 	breaker, err := collector.NewCircuitBreaker(5, 60*time.Second)
@@ -279,42 +296,14 @@ func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeCo
 		return
 	}
 
-	sendBatch := func() {
-		if err := buf.FlushCompress(ctx, func(ctx context.Context, compressedGzip []byte) error {
+	sendBatch := func(flushCtx context.Context) {
+		if err := buf.FlushCompress(flushCtx, func(ctx context.Context, compressedGzip []byte) error {
 			if err := breaker.Allow(); err != nil {
 				return err
 			}
-			client, err := createHTTPClient(hubMetricsURL)
+			err := hubClient.SendCompressed(ctx, hubMetricsURL, compressedGzip)
 			if err != nil {
 				breaker.RecordFailure(err)
-				return err
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubMetricsURL, bytes.NewBuffer(compressedGzip))
-			if err != nil {
-				breaker.RecordFailure(err)
-				return err
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Content-Encoding", "gzip")
-			if authToken != "" {
-				req.Header.Set("Authorization", "Bearer "+authToken)
-			}
-			req.Header.Set("X-Tenant-ID", tenantID)
-			req.Header.Set("X-Agent-ID", agentID)
-			copyHeaders(req.Header, headers)
-
-			resp, err := client.Do(req)
-			if err != nil {
-				breaker.RecordFailure(err)
-				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode >= 400 {
-				err := fmt.Errorf("hub rejected batch payload with status: %d", resp.StatusCode)
-				if resp.StatusCode >= 500 {
-					breaker.RecordFailure(err)
-				}
 				return err
 			}
 			breaker.RecordSuccess()
@@ -326,20 +315,23 @@ func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeCo
 
 	// Direkt nach dem Start berichten, damit lokale Demos und Healthchecks nicht 30 Sekunden warten.
 	if reportFIMAlerts(buf, fimScanner, nodeID) {
-		sendBatch()
+		sendBatch(ctx)
 	}
 	collectAndBufferMetrics(ctx, buf, nodeID, agentID, tenantID, customerID)
-	sendBatch()
+	sendBatch(ctx)
 	for {
 		select {
 		case <-ctx.Done():
+			flushCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			sendBatch(flushCtx)
+			cancel()
 			return
 		case <-timer.C:
 			if reportFIMAlerts(buf, fimScanner, nodeID) {
-				sendBatch()
+				sendBatch(ctx)
 			}
 			collectAndBufferMetrics(ctx, buf, nodeID, agentID, tenantID, customerID)
-			sendBatch()
+			sendBatch(ctx)
 			interval := runtimeConfig.Load().CollectorInterval
 			if interval <= 0 {
 				interval = 30 * time.Second
@@ -435,6 +427,15 @@ func createHTTPClient(endpoint string) (*http.Client, error) {
 		return &http.Client{Timeout: 15 * time.Second}, nil
 	}
 	return createMTLSClient()
+}
+
+func newHubClient(config agentclient.ClientConfig) (*agentclient.Client, error) {
+	config.Retry = agentclient.RetryPolicy{
+		Attempts:  5,
+		BaseDelay: 250 * time.Millisecond,
+		MaxDelay:  30 * time.Second,
+	}
+	return agentclient.NewClient(config)
 }
 
 func createMTLSClient() (*http.Client, error) {

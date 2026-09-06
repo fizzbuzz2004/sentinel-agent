@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 const maxBinarySize int64 = 256 * 1024 * 1024
@@ -31,6 +32,8 @@ type Updater struct {
 	publicKey ed25519.PublicKey
 	target    string
 	headers   http.Header
+	mu        sync.Mutex
+	backup    string
 }
 
 func New(client *http.Client, publicKey ed25519.PublicKey, target string) (*Updater, error) {
@@ -76,11 +79,77 @@ func (u *Updater) Apply(ctx context.Context, manifestURL string) error {
 	if err := verifySignature(tmpFile, manifest.Checksum, manifest.Signature, u.publicKey); err != nil {
 		return fmt.Errorf("update signature verification failed: %w", err)
 	}
+	backup, err := backupBinary(u.target)
+	if err != nil {
+		return fmt.Errorf("create update backup: %w", err)
+	}
 	if err := atomicReplace(tmpFile, u.target); err != nil {
+		if backup != "" {
+			_ = os.Remove(backup)
+		}
 		return fmt.Errorf("atomic binary replacement failed: %w", err)
 	}
+	u.mu.Lock()
+	u.backup = backup
+	u.mu.Unlock()
 	slog.Info("Agent-Binary erfolgreich aktualisiert", "component", "updater", "version", manifest.Version)
 	return nil
+}
+
+// Rollback restores the binary saved by the most recent successful Apply.
+func (u *Updater) Rollback() error {
+	u.mu.Lock()
+	backup := u.backup
+	u.mu.Unlock()
+	if backup == "" {
+		return fmt.Errorf("no update backup available")
+	}
+	if err := atomicReplace(backup, u.target); err != nil {
+		return fmt.Errorf("rollback binary replacement failed: %w", err)
+	}
+	_ = os.Remove(backup)
+	u.mu.Lock()
+	u.backup = ""
+	u.mu.Unlock()
+	slog.Warn("Agent-Update zurückgerollt", "component", "updater", "target", u.target)
+	return nil
+}
+
+func backupBinary(target string) (string, error) {
+	input, err := os.Open(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer input.Close()
+	backup, err := os.CreateTemp(filepath.Dir(target), "sentinel-backup-*")
+	if err != nil {
+		return "", err
+	}
+	name := backup.Name()
+	cleanup := true
+	defer func() {
+		_ = backup.Close()
+		if cleanup {
+			_ = os.Remove(name)
+		}
+	}()
+	if _, err := io.Copy(backup, input); err != nil {
+		return "", err
+	}
+	if err := backup.Chmod(0755); err != nil {
+		return "", err
+	}
+	if err := backup.Sync(); err != nil {
+		return "", err
+	}
+	if err := backup.Close(); err != nil {
+		return "", err
+	}
+	cleanup = false
+	return name, nil
 }
 
 func downloadBinary(ctx context.Context, client *http.Client, binaryURL string, headers http.Header) (string, error) {

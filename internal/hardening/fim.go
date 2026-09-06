@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -35,7 +36,7 @@ func (f *FIMScanner) BuildBaseline() {
 		hash, err := calculateSHA256(path)
 		if err == nil {
 			f.baselineCache[path] = hash
-			slog.Info("FIM Baseline registriert", "path", path, "hash", hash[:12])
+			slog.Info("FIM Baseline registriert", "path", sanitizePath(path), "hash", hash[:12])
 		}
 	}
 }
@@ -49,7 +50,7 @@ func (f *FIMScanner) CheckIntegrity(nodeID string) []FIMAlert {
 		if err != nil {
 			alerts = append(alerts, FIMAlert{
 				NodeID:    nodeID,
-				FilePath:  path,
+				FilePath:  sanitizePath(path),
 				Event:     "DELETED_OR_UNACCESSIBLE",
 				Timestamp: time.Now().UTC(),
 			})
@@ -58,10 +59,10 @@ func (f *FIMScanner) CheckIntegrity(nodeID string) []FIMAlert {
 
 		if oldHash, exists := f.baselineCache[path]; exists {
 			if oldHash != currentHash {
-				slog.Error("SICHERHEITSALARM: Kritische Datei manipuliert!", "path", path)
+				slog.Error("SICHERHEITSALARM: Kritische Datei manipuliert!", "path", sanitizePath(path))
 				alerts = append(alerts, FIMAlert{
 					NodeID:    nodeID,
-					FilePath:  path,
+					FilePath:  sanitizePath(path),
 					Event:     "MODIFIED",
 					Timestamp: time.Now().UTC(),
 				})
@@ -69,6 +70,29 @@ func (f *FIMScanner) CheckIntegrity(nodeID string) []FIMAlert {
 		}
 	}
 	return alerts
+}
+
+func sanitizePath(path string) string {
+	path = strings.ReplaceAll(path, "\\", "/")
+	for _, prefix := range []string{"/home/", "/Users/"} {
+		if strings.HasPrefix(path, prefix) {
+			parts := strings.SplitN(strings.TrimPrefix(path, prefix), "/", 2)
+			if len(parts) == 1 {
+				return prefix + "<user>"
+			}
+			return prefix + "<user>/" + parts[1]
+		}
+	}
+	if len(path) >= 9 && strings.Contains(path, ":/Users/") {
+		volume := path[:2]
+		rest := strings.TrimPrefix(path[2:], "/Users/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 1 {
+			return volume + "/Users/<user>"
+		}
+		return volume + "/Users/<user>/" + parts[1]
+	}
+	return path
 }
 
 func calculateSHA256(filePath string) (string, error) {

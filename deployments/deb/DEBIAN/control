@@ -1,0 +1,9 @@
+Package: sentinel-agent
+Version: 0.1.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: SentinelCore
+Description: SentinelCore Enterprise Security Agent
+ Secure mTLS telemetry, encrypted disk spooling and signed updates for MSP-managed endpoints.
+Depends: systemd, ca-certificates

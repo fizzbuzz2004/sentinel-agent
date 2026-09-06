@@ -54,7 +54,7 @@ func PerformInitialEnrollment(hubURL string, enrollmentToken string) error {
 
 	// HTTP-Client mit TLS-Härtung (Sicherheit Prio 1)
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13},
 	}
 	client := &http.Client{
 		Transport: tr,
@@ -73,6 +73,9 @@ func PerformInitialEnrollment(hubURL string, enrollmentToken string) error {
 	if agentIdentity, identityErr := identity.LoadFromEnvironmentOrFile(identityPath); identityErr == nil {
 		req.Header.Set("X-Tenant-ID", agentIdentity.TenantID)
 		req.Header.Set("X-Agent-ID", agentIdentity.AgentID)
+	}
+	if authToken := os.Getenv("ENTERPRISE_AUTH_TOKEN"); authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+systemctl daemon-reload
+systemctl enable sentinel-agent.service >/dev/null 2>&1 || true
+if [ "$1" = "configure" ] && systemctl is-active --quiet sentinel-agent.service; then
+    systemctl try-restart sentinel-agent.service || true
+fi
+exit 0

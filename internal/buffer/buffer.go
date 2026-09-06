@@ -40,6 +40,9 @@ type DiskBuffer struct {
 
 const defaultMaxFileBytes int64 = 10 * 1024 * 1024
 
+var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+var gzipBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func NewDiskBuffer(storagePath string, maxSize int, masterKey []byte) (*DiskBuffer, error) {
 	return NewDiskBufferWithLimits(storagePath, maxSize, defaultMaxFileBytes, masterKey)
 }
@@ -179,17 +182,27 @@ func (b *DiskBuffer) FlushCompress(ctx context.Context, sendFunc func(ctx contex
 		return fmt.Errorf("buffer serialization failed: %w", err)
 	}
 
-	var gzipBuffer bytes.Buffer
-	gzipWriter := gzip.NewWriter(&gzipBuffer)
+	gzipBuffer := gzipBufferPool.Get().(*bytes.Buffer)
+	gzipBuffer.Reset()
+	defer gzipBufferPool.Put(gzipBuffer)
+	gzipWriter := gzipWriterPool.Get().(*gzip.Writer)
+	gzipWriter.Reset(gzipBuffer)
 	if _, err := gzipWriter.Write(rawJSON); err != nil {
 		_ = gzipWriter.Close()
+		gzipWriter.Reset(io.Discard)
+		gzipWriterPool.Put(gzipWriter)
 		return fmt.Errorf("gzip compression failed: %w", err)
 	}
 	if err := gzipWriter.Close(); err != nil {
+		gzipWriter.Reset(io.Discard)
+		gzipWriterPool.Put(gzipWriter)
 		return fmt.Errorf("gzip writer close failed: %w", err)
 	}
+	compressed := append([]byte(nil), gzipBuffer.Bytes()...)
+	gzipWriter.Reset(io.Discard)
+	gzipWriterPool.Put(gzipWriter)
 
-	if err := sendFunc(ctx, gzipBuffer.Bytes()); err != nil {
+	if err := sendFunc(ctx, compressed); err != nil {
 		return fmt.Errorf("flush callback failed: %w", err)
 	}
 

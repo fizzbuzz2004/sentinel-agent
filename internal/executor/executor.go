@@ -52,6 +52,7 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get("X-Command-Signature")
 	runner := NewSecureRunner(secret)
 	if !runner.VerifySignature(ansibleBinary+" "+ansiblePlaybook, signature) {
+		slog.Warn("Sicherheitsereignis: ungültige HMAC-Signatur für Remote-Hardening verworfen", "component", "security", "event", "invalid_command_signature")
 		http.Error(w, "invalid command signature", http.StatusUnauthorized)
 		return
 	}

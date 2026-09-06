@@ -2,10 +2,13 @@ package config
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -93,27 +96,43 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) poll(ctx context.Context) error {
-	client, err := p.clientProvider()
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint, nil)
-	if err != nil {
-		return err
-	}
-	for key, values := range p.headers {
-		for _, value := range values {
-			req.Header.Add(key, value)
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		client, err := p.clientProvider()
+		if err == nil {
+			var req *http.Request
+			req, err = http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint, nil)
+			if err == nil {
+				for key, values := range p.headers {
+					for _, value := range values {
+						req.Header.Add(key, value)
+					}
+				}
+				resp, err = client.Do(req)
+			}
+		}
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			lastErr = fmt.Errorf("config server returned HTTP %d", resp.StatusCode)
+			_ = resp.Body.Close()
+			resp = nil
+		} else {
+			lastErr = err
+		}
+		if attempt == 3 || !isTransient(lastErr) {
+			return lastErr
+		}
+		if err := waitWithJitter(ctx, attempt); err != nil {
+			return err
 		}
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+	if resp == nil {
+		return lastErr
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("config server returned HTTP %d", resp.StatusCode)
-	}
 
 	var payload configResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -142,6 +161,31 @@ func (p *Poller) poll(ctx context.Context) error {
 	}
 	slog.Info("Runtime-Konfiguration aktualisiert", "component", "config", "collector_interval", next.CollectorInterval, "log_level", next.LogLevel.String())
 	return nil
+}
+
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "HTTP 5") || strings.Contains(message, "HTTP 429") || !strings.Contains(message, "HTTP ")
+}
+
+func waitWithJitter(ctx context.Context, attempt int) error {
+	cap := 250 * time.Millisecond * time.Duration(uint64(1)<<attempt)
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return err
+	}
+	delay := time.Duration(binary.LittleEndian.Uint64(raw[:]) % uint64(cap))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func parseLevel(value string) (slog.Level, error) {
